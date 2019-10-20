@@ -673,7 +673,7 @@ BEGIN
       SELECT extnamespace::regnamespace INTO extschema
          FROM pg_catalog.pg_extension
          WHERE extname = 'oracle_fdw';
-      EXECUTE format('SET LOCAL search_path = %I', extschema);
+      EXECUTE format('SET LOCAL search_path = %s', extschema);
       PERFORM oracle_diag(server);
    EXCEPTION
       WHEN OTHERS THEN
@@ -703,7 +703,7 @@ BEGIN
          OR schema =ANY (only_schemas);
 
    /* set "search_path" to the PostgreSQL stage */
-   EXECUTE format('SET LOCAL search_path = %I, %I', pgstage_schema, extschema);
+   EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* loop through Oracle columns and translate them to PostgreSQL columns */
    LOOP
@@ -1050,7 +1050,7 @@ BEGIN
       SELECT extnamespace::regnamespace INTO extschema
          FROM pg_catalog.pg_extension
          WHERE extname = 'oracle_fdw';
-      EXECUTE format('SET LOCAL search_path = %I', extschema);
+      EXECUTE format('SET LOCAL search_path = %s', extschema);
       PERFORM oracle_diag(server);
    EXCEPTION
       WHEN OTHERS THEN
@@ -1095,11 +1095,11 @@ BEGIN
    SET LOCAL client_min_messages = warning;
 
    /* create the migration views in the Oracle staging schema */
-   EXECUTE format('SET LOCAL search_path = %I', extschema);
+   EXECUTE format('SET LOCAL search_path = %s', extschema);
    PERFORM create_oraviews(server, staging_schema, max_long);
 
    /* set "search_path" to the PostgreSQL stage */
-   EXECUTE format('SET LOCAL search_path = %I, %I, %I', pgstage_schema, staging_schema, extschema);
+   EXECUTE format('SET LOCAL search_path = %I, %I, %s', pgstage_schema, staging_schema, extschema);
 
    /* create tables in the PostgreSQL stage */
    CREATE TABLE columns(
@@ -1345,7 +1345,7 @@ BEGIN
    EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
 
    /* copy data from the Oracle stage to the PostgreSQL stage */
-   EXECUTE format('SET LOCAL search_path = %I', extschema);
+   EXECUTE format('SET LOCAL search_path = %s', extschema);
    RETURN oracle_migrate_refresh(server, staging_schema, pgstage_schema, only_schemas, max_long);
 END;$$;
 
@@ -1395,7 +1395,7 @@ BEGIN
    SELECT extnamespace::regnamespace INTO extschema
       FROM pg_catalog.pg_extension
       WHERE extname = 'ora_migrator';
-   EXECUTE format('SET LOCAL search_path = %I, %I', pgstage_schema, extschema);
+   EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
    only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
@@ -1478,7 +1478,7 @@ BEGIN
       IF o_sch <> sch OR o_tab <> tab THEN
          IF o_tab <> '' THEN
             BEGIN
-               IF o_query IS NULL THEN
+               IF o_fquery IS NULL THEN
                   stmt := stmt || format(E') SERVER %I\n'
                                        '   OPTIONS (schema ''%s'', table ''%s'', readonly ''true'', max_long ''%s'')',
                                       server, o_fsch, o_ftab, max_long);
@@ -1605,7 +1605,7 @@ BEGIN
    SELECT extnamespace::regnamespace INTO extschema
       FROM pg_catalog.pg_extension
       WHERE extname = 'ora_migrator';
-   EXECUTE format('SET LOCAL search_path = %I, %I', pgstage_schema, extschema);
+   EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
    only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
@@ -1667,7 +1667,7 @@ BEGIN
    SELECT extnamespace::regnamespace INTO extschema
       FROM pg_catalog.pg_extension
       WHERE extname = 'ora_migrator';
-   EXECUTE format('SET LOCAL search_path = %I, %I', pgstage_schema, extschema);
+   EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
    only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
@@ -1749,7 +1749,7 @@ BEGIN
    SELECT extnamespace::regnamespace INTO extschema
       FROM pg_catalog.pg_extension
       WHERE extname = 'ora_migrator';
-   EXECUTE format('SET LOCAL search_path = %I, %I', pgstage_schema, extschema);
+   EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
    only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
@@ -1827,7 +1827,7 @@ BEGIN
    SELECT extnamespace::regnamespace INTO extschema
       FROM pg_catalog.pg_extension
       WHERE extname = 'ora_migrator';
-   EXECUTE format('SET LOCAL search_path = %I, %I', pgstage_schema, extschema);
+   EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
    only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
@@ -1913,7 +1913,7 @@ BEGIN
    SELECT extnamespace::regnamespace INTO extschema
       FROM pg_catalog.pg_extension
       WHERE extname = 'ora_migrator';
-   EXECUTE format('SET LOCAL search_path = %I, %I', pgstage_schema, extschema);
+   EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
    only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
@@ -2014,7 +2014,7 @@ BEGIN
    SELECT extnamespace::regnamespace INTO extschema
       FROM pg_catalog.pg_extension
       WHERE extname = 'ora_migrator';
-   EXECUTE format('SET LOCAL search_path = %I, %I', pgstage_schema, extschema);
+   EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
    only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
@@ -2045,7 +2045,7 @@ BEGIN
 
          EXECUTE stmt;
 
-         EXECUTE format('SET LOCAL search_path = %I, %I', pgstage_schema, extschema);
+         EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
       EXCEPTION
          WHEN others THEN
             /* turn the error into a warning */
@@ -2131,7 +2131,7 @@ BEGIN
    SELECT extnamespace::regnamespace INTO extschema
       FROM pg_catalog.pg_extension
       WHERE extname = 'ora_migrator';
-   EXECUTE format('SET LOCAL search_path = %I, %I', pgstage_schema, extschema);
+   EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
    only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
@@ -2608,7 +2608,7 @@ BEGIN
    SELECT extnamespace::regnamespace INTO extschema
       FROM pg_catalog.pg_extension
       WHERE extname = 'ora_migrator';
-   EXECUTE format('SET LOCAL search_path = %I', extschema);
+   EXECUTE format('SET LOCAL search_path = %s', extschema);
 
    /*
     * First step:
@@ -2874,7 +2874,7 @@ BEGIN
    SELECT extnamespace::regnamespace INTO extschema
       FROM pg_catalog.pg_extension
       WHERE extname = 'ora_migrator';
-   EXECUTE format('SET LOCAL search_path = %I, %I', pgstage_schema, extschema);
+   EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
    only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
