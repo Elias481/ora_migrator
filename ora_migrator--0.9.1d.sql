@@ -574,7 +574,8 @@ CREATE FUNCTION oracle_materialize(
    t name,
    with_data boolean DEFAULT TRUE,
    pgstage_schema name DEFAULT NAME 'pgsql_stage',
-   with_create boolean DEFAULT TRUE
+   with_create boolean DEFAULT TRUE,
+   deferred_rename boolean DEFAULT TRUE
 ) RETURNS boolean
    LANGUAGE plpgsql VOLATILE STRICT SET search_path = pg_catalog AS
 $$DECLARE
@@ -585,7 +586,9 @@ BEGIN
    BEGIN
       /* rename the foreign table */
       ft := t || E'\x07';
-      EXECUTE format('ALTER FOREIGN TABLE %I.%I RENAME TO %I', s, t, ft);
+      IF deferred_rename THEN
+         EXECUTE format('ALTER FOREIGN TABLE %I.%I RENAME TO %I', s, t, ft);
+      END IF;
 
       /* create a table if desired */
       IF with_create THEN
@@ -632,7 +635,7 @@ BEGIN
    RETURN FALSE;
 END;$$;
 
-COMMENT ON FUNCTION oracle_materialize(name, name, boolean, name, boolean) IS
+COMMENT ON FUNCTION oracle_materialize(name, name, boolean, name, boolean, boolean) IS
    'turn an Oracle foreign table into a PostgreSQL table';
 
 CREATE FUNCTION oracle_migrate_refresh(
@@ -1358,7 +1361,8 @@ CREATE FUNCTION oracle_migrate_mkforeign(
    pgstage_schema name    DEFAULT NAME 'pgsql_stage',
    only_schemas   name[]  DEFAULT NULL,
    max_long       integer DEFAULT 32767,
-   with_sequences boolean DEFAULT TRUE
+   with_sequences boolean DEFAULT TRUE,
+   deferred_rename boolean DEFAULT TRUE
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
 $$DECLARE
@@ -1519,7 +1523,11 @@ BEGIN
             END;
          END IF;
 
-         stmt := format(E'CREATE FOREIGN TABLE %I.%I (\n', sch, tab);
+         IF deferred_rename THEN
+            stmt := format(E'CREATE FOREIGN TABLE %I.%I (\n', sch, tab);
+         ELSE
+            stmt := format(E'CREATE FOREIGN TABLE %I.%I (\n', sch, tab || E'\x07');
+         END IF;
          o_sch := sch;
          o_tab := tab;
          o_fsch := fsch;
@@ -1537,9 +1545,16 @@ BEGIN
    /* last foreign table */
    IF o_tab <> '' THEN
       BEGIN
-         EXECUTE stmt || format(E') SERVER %I\n'
+         IF o_fquery IS NULL THEN
+            stmt := stmt || format(E') SERVER %I\n'
                                  '   OPTIONS (schema ''%s'', table ''%s'', readonly ''true'', max_long ''%s'')',
                                 server, o_fsch, o_ftab, max_long);
+         ELSE
+            stmt := stmt || format(E') SERVER %I\n'
+                                 '   OPTIONS (table ''(%s)'', readonly ''true'', max_long ''%s'')',
+                                server, quote_literal(o_fquery), max_long);
+         END IF;
+         EXECUTE stmt;
       EXCEPTION
          WHEN others THEN
             /* turn the error into a warning */
@@ -1563,9 +1578,7 @@ BEGIN
                   pgstage_schema,
                   sch,
                   tab,
-                  stmt || format(E') SERVER %I\n'
-                                 '   OPTIONS (schema ''%s'', table ''%s'', readonly ''true'', max_long ''%s'')',
-                                 server, o_fsch, o_ftab, max_long),
+                  stmt,
                   errmsg || coalesce(': ' || detail, '')
                );
 
@@ -1579,7 +1592,7 @@ BEGIN
    RETURN rc;
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_mkforeign(name, name, name, name[], integer, boolean) IS
+COMMENT ON FUNCTION oracle_migrate_mkforeign(name, name, name, name[], integer, boolean, boolean) IS
    'second step of "oracle_migrate": create schemas, sequemces and foreign tables';
 
 CREATE FUNCTION oracle_migrate_tables(
