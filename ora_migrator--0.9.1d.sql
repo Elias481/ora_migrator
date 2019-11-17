@@ -6,7 +6,7 @@
 CREATE FUNCTION create_oraviews (
    server      name,
    schema      name    DEFAULT NAME 'public',
-   max_long integer DEFAULT 32767
+   max_long    integer DEFAULT 32767
 ) RETURNS void
    LANGUAGE plpgsql VOLATILE STRICT SET search_path = pg_catalog AS
 $$DECLARE
@@ -569,6 +569,25 @@ $$SELECT CASE WHEN $1 < -9223372036854775808
               ELSE $1::bigint
          END$$;
 
+COMMENT ON FUNCTION adjust_to_bigint(numeric) IS
+   'helper function to translate out-of-range numerics to PostgreSQL bigint';
+
+CREATE FUNCTION oname_remapto_pname(text, text[][]) RETURNS name
+   LANGUAGE sql STABLE CALLED ON NULL INPUT SET search_path = pg_catalog AS
+$$SELECT CASE WHEN pname IS NULL
+              THEN CASE WHEN $1 = upper($1) THEN lower($1)::name ELSE $1::name END
+              ELSE pname::name
+         END
+  FROM (SELECT oname, pname
+        FROM unnest($2[:][array_lower($2,2):array_lower($2,2)],$2[:][array_lower($2,2)+1:array_lower($2,2)+1])
+         as t(oname, pname)
+        UNION ALL SELECT $1 oname, NULL pname) lt
+  WHERE lt.oname = $1
+  LIMIT 1$$;
+
+COMMENT ON FUNCTION oname_remapto_pname(text, text[][]) IS
+   'helper function to translate oracle name using translation array lookup and folding all-upper to all-lower if no translation given';
+
 CREATE FUNCTION oracle_materialize(
    s name,
    t name,
@@ -640,10 +659,11 @@ COMMENT ON FUNCTION oracle_materialize(name, name, boolean, name, boolean, boole
 
 CREATE FUNCTION oracle_migrate_refresh(
    server         name,
-   staging_schema name    DEFAULT NAME 'ora_stage',
-   pgstage_schema name    DEFAULT NAME 'pgsql_stage',
-   only_schemas   name[]  DEFAULT NULL,
-   max_long       integer DEFAULT 32767
+   staging_schema name     DEFAULT NAME 'ora_stage',
+   pgstage_schema name     DEFAULT NAME 'pgsql_stage',
+   only_schemas   text[]   DEFAULT NULL,
+   max_long       integer  DEFAULT 32767,
+   schema_remap   text[][] DEFAULT NULL
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
 $$DECLARE
@@ -762,7 +782,7 @@ BEGIN
       /* insert a row into the columns table */
       INSERT INTO columns (schema, table_name, column_name, oracle_name, position, type_name, oracle_type, nullable, default_value)
          VALUES (
-            oracle_tolower(v_schema),
+            oname_remapto_pname(v_schema, schema_remap),
             oracle_tolower(v_table),
             oracle_tolower(v_column),
             v_column,
@@ -781,7 +801,7 @@ BEGIN
 
    /* copy "tables" table */
    EXECUTE format(E'INSERT INTO tables (schema, oracle_schema, table_name, oracle_name)\n'
-                   '   SELECT oracle_tolower(schema),\n'
+                   '   SELECT oname_remapto_pname(schema, $2),\n'
                    '          schema,\n'
                    '          oracle_tolower(table_name),\n'
                    '          table_name\n'
@@ -791,11 +811,11 @@ BEGIN
                    '   oracle_schema = EXCLUDED.oracle_schema,\n'
                    '   oracle_name   = EXCLUDED.oracle_name',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* copy "checks" table */
    EXECUTE format(E'INSERT INTO checks (schema, table_name, constraint_name, "deferrable", deferred, condition)\n'
-                   '   SELECT oracle_tolower(schema),\n'
+                   '   SELECT oname_remapto_pname(schema, $2),\n'
                    '          oracle_tolower(table_name),\n'
                    '          oracle_tolower(constraint_name),\n'
                    '          "deferrable",\n'
@@ -809,12 +829,12 @@ BEGIN
                    '   deferred     = EXCLUDED.deferred,\n'
                    '   condition    = lower(EXCLUDED.condition)',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* copy "foreign_keys" table */
    EXECUTE format(E'INSERT INTO foreign_keys (schema, table_name, constraint_name, "deferrable", deferred, delete_rule,\n'
                    '                          column_name, position, remote_schema, remote_table, remote_column)\n'
-                   '   SELECT oracle_tolower(schema),\n'
+                   '   SELECT oname_remapto_pname(schema, $2),\n'
                    '          oracle_tolower(table_name),\n'
                    '          oracle_tolower(constraint_name),\n'
                    '          "deferrable",\n'
@@ -836,11 +856,11 @@ BEGIN
                    '   remote_table  = oracle_tolower(EXCLUDED.remote_table),\n'
                    '   remote_column = oracle_tolower(EXCLUDED.remote_column)',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* copy "keys" table */
    EXECUTE format(E'INSERT INTO keys (schema, table_name, constraint_name, "deferrable", deferred, column_name, position, is_primary)\n'
-                   '   SELECT oracle_tolower(schema),\n'
+                   '   SELECT oname_remapto_pname(schema, $2),\n'
                    '          oracle_tolower(table_name),\n'
                    '          oracle_tolower(constraint_name),\n'
                    '          "deferrable",\n'
@@ -856,11 +876,11 @@ BEGIN
                    '   column_name   = oracle_tolower(EXCLUDED.column_name),\n'
                    '   is_primary    = EXCLUDED.is_primary',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* copy "views" table */
    EXECUTE format(E'INSERT INTO views (schema, view_name, definition, oracle_def)\n'
-                   '   SELECT oracle_tolower(schema),\n'
+                   '   SELECT oname_remapto_pname(schema, $2),\n'
                    '          oracle_tolower(view_name),\n'
                    '          definition,\n'
                    '          definition\n'
@@ -869,11 +889,11 @@ BEGIN
                    'ON CONFLICT ON CONSTRAINT views_pkey DO UPDATE SET\n'
                    '   oracle_def = EXCLUDED.definition',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* copy "functions" view */
    EXECUTE format(E'INSERT INTO functions (schema, function_name, is_procedure, source, oracle_source)\n'
-                   '   SELECT oracle_tolower(schema),\n'
+                   '   SELECT oname_remapto_pname(schema, $2),\n'
                    '          oracle_tolower(function_name),\n'
                    '          is_procedure,\n'
                    '          source,\n'
@@ -884,12 +904,12 @@ BEGIN
                    '   is_procedure  = EXCLUDED.is_procedure,\n'
                    '   oracle_source = EXCLUDED.source',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* copy "sequences" view */
    EXECUTE format(E'INSERT INTO sequences (schema, sequence_name, min_value, max_value, increment_by,\n'
                    '                       cyclical, cache_size, last_value, oracle_value)\n'
-                   '   SELECT oracle_tolower(schema),\n'
+                   '   SELECT oname_remapto_pname(schema, $2),\n'
                    '          oracle_tolower(sequence_name),\n'
                    '          adjust_to_bigint(min_value),\n'
                    '          adjust_to_bigint(max_value),\n'
@@ -908,11 +928,11 @@ BEGIN
                    '   cache_size   = EXCLUDED.cache_size,\n'
                    '   oracle_value = EXCLUDED.oracle_value',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* copy "index_columns" view */
    EXECUTE format(E'INSERT INTO index_columns (schema, table_name, index_name, uniqueness, position, descend, is_expression, column_name)\n'
-                   '   SELECT oracle_tolower(schema),\n'
+                   '   SELECT oname_remapto_pname(schema, $2),\n'
                    '          oracle_tolower(table_name),\n'
                    '          oracle_tolower(index_name),\n'
                    '          uniqueness,\n'
@@ -929,7 +949,7 @@ BEGIN
                    '   is_expression = EXCLUDED.is_expression,\n'
                    '   column_name   = EXCLUDED.column_name',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* refresh "indexes" table */
    INSERT INTO indexes (schema, table_name, index_name, uniqueness)
@@ -944,17 +964,17 @@ BEGIN
 
    /* copy "schemas" table */
    EXECUTE format(E'INSERT INTO schemas (schema)\n'
-                   '   SELECT oracle_tolower(schema)\n'
+                   '   SELECT oname_remapto_pname(schema, $2)\n'
                    '   FROM %I.schemas\n'
                    '   WHERE $1 IS NULL OR schema =ANY ($1)\n'
                    'ON CONFLICT DO NOTHING',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* copy "triggers" view */
    EXECUTE format(E'INSERT INTO triggers (schema, table_name, trigger_name, is_before, triggering_event,\n'
                    '                      for_each_row, when_clause, referencing_names, trigger_body, oracle_source)\n'
-                   '   SELECT oracle_tolower(schema),\n'
+                   '   SELECT oname_remapto_pname(schema, $2),\n'
                    '          oracle_tolower(table_name),\n'
                    '          oracle_tolower(trigger_name),\n'
                    '          is_before,\n'
@@ -974,11 +994,11 @@ BEGIN
                    '   referencing_names = EXCLUDED.referencing_names,\n'
                    '   oracle_source     = EXCLUDED.oracle_source',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* copy "packages" view */
    EXECUTE format(E'INSERT INTO packages (schema, package_name, is_body, source)\n'
-                   '   SELECT oracle_tolower(schema),\n'
+                   '   SELECT oname_remapto_pname(schema, $2),\n'
                    '          oracle_tolower(package_name),\n'
                    '          is_body,\n'
                    '          source\n'
@@ -987,11 +1007,11 @@ BEGIN
                    'ON CONFLICT ON CONSTRAINT packages_pkey DO UPDATE SET\n'
                    '   source  = EXCLUDED.source',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* copy "table_privs" table */
    EXECUTE format(E'INSERT INTO table_privs (schema, table_name, privilege, grantor, grantee, grantable)\n'
-                   '   SELECT oracle_tolower(schema),\n'
+                   '   SELECT oname_remapto_pname(schema, $2),\n'
                    '          oracle_tolower(table_name),\n'
                    '          privilege,\n'
                    '          oracle_tolower(grantor),\n'
@@ -1003,11 +1023,11 @@ BEGIN
                    '   grantor   = EXCLUDED.grantor,\n'
                    '   grantable = EXCLUDED.grantable',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* copy "column_privs" table */
    EXECUTE format(E'INSERT INTO column_privs (schema, table_name, column_name, privilege, grantor, grantee, grantable)\n'
-                   '   SELECT oracle_tolower(schema),\n'
+                   '   SELECT oname_remapto_pname(schema, $2),\n'
                    '          oracle_tolower(table_name),\n'
                    '          oracle_tolower(column_name),\n'
                    '          privilege,\n'
@@ -1020,7 +1040,7 @@ BEGIN
                    '   grantor   = EXCLUDED.grantor,\n'
                    '   grantable = EXCLUDED.grantable',
                   staging_schema)
-      USING only_schemas;
+      USING only_schemas, schema_remap;
 
    /* reset client_min_messages */
    EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
@@ -1028,15 +1048,16 @@ BEGIN
    RETURN 0;
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_refresh(name, name, name, name[], integer) IS
+COMMENT ON FUNCTION oracle_migrate_refresh(name, name, name, text[], integer, text[][]) IS
   'update the PostgreSQL stage with values from the Oracle stage';
 
 CREATE FUNCTION oracle_migrate_prepare(
    server         name,
-   staging_schema name    DEFAULT NAME 'ora_stage',
-   pgstage_schema name    DEFAULT NAME 'pgsql_stage',
-   only_schemas   name[]  DEFAULT NULL,
-   max_long       integer DEFAULT 32767
+   staging_schema name     DEFAULT NAME 'ora_stage',
+   pgstage_schema name     DEFAULT NAME 'pgsql_stage',
+   only_schemas   text[]   DEFAULT NULL,
+   max_long       integer  DEFAULT 32767,
+   schema_remap   text[][] DEFAULT NULL
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
 $$DECLARE
@@ -1349,23 +1370,25 @@ BEGIN
 
    /* copy data from the Oracle stage to the PostgreSQL stage */
    EXECUTE format('SET LOCAL search_path = %s', extschema);
-   RETURN oracle_migrate_refresh(server, staging_schema, pgstage_schema, only_schemas, max_long);
+   RETURN oracle_migrate_refresh(server, staging_schema, pgstage_schema, only_schemas, max_long, schema_remap);
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_prepare(name, name, name, name[], integer) IS
+COMMENT ON FUNCTION oracle_migrate_prepare(name, name, name, text[], integer, text[][]) IS
    'first step of "oracle_migrate": create and populate staging schemas';
 
 CREATE FUNCTION oracle_migrate_mkforeign(
-   server         name,
-   staging_schema name    DEFAULT NAME 'ora_stage',
-   pgstage_schema name    DEFAULT NAME 'pgsql_stage',
-   only_schemas   name[]  DEFAULT NULL,
-   max_long       integer DEFAULT 32767,
-   with_sequences boolean DEFAULT TRUE,
-   deferred_rename boolean DEFAULT TRUE
+   server          name,
+   staging_schema  name     DEFAULT NAME 'ora_stage',
+   pgstage_schema  name     DEFAULT NAME 'pgsql_stage',
+   only_schemas    text[]   DEFAULT NULL,
+   max_long        integer  DEFAULT 32767,
+   with_sequences  boolean  DEFAULT TRUE,
+   deferred_rename boolean  DEFAULT TRUE,
+   schema_remap    text[][] DEFAULT NULL
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
 $$DECLARE
+   pg_schemas   name[];
    extschema    name;
    s            name;
    t            name;
@@ -1402,7 +1425,7 @@ BEGIN
    EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
-   only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
+   pg_schemas := array_agg(oname_remapto_pname(os, schema_remap)) FROM unnest(only_schemas) os;
 
    EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
    RAISE NOTICE 'Creating schemas ...';
@@ -1411,8 +1434,8 @@ BEGIN
    /* loop through the schemas that should be migrated */
    FOR s IN
       SELECT schema FROM schemas
-      WHERE only_schemas IS NULL
-         OR schema =ANY (only_schemas)
+      WHERE pg_schemas IS NULL
+         OR schema =ANY (pg_schemas)
    LOOP
       BEGIN
          /* create schema */
@@ -1449,7 +1472,7 @@ BEGIN
 
    /* create sequences if desired */
    IF with_sequences THEN
-      rc := rc + oracle_migrate_sequences(pgstage_schema, only_schemas);
+      rc := rc + oracle_migrate_sequences(pgstage_schema, only_schemas, schema_remap);
    END IF;
 
    EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
@@ -1526,7 +1549,7 @@ BEGIN
          IF deferred_rename THEN
             stmt := format(E'CREATE FOREIGN TABLE %I.%I (\n', sch, tab);
          ELSE
-            stmt := format(E'CREATE FOREIGN TABLE %I.%I (\n', sch, tab || E'\x07');
+            stmt := format(E'CREATE FOREIGN TABLE %I.%I\x07 (\n', sch, tab);
          END IF;
          o_sch := sch;
          o_tab := tab;
@@ -1592,17 +1615,19 @@ BEGIN
    RETURN rc;
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_mkforeign(name, name, name, name[], integer, boolean, boolean) IS
+COMMENT ON FUNCTION oracle_migrate_mkforeign(name, name, name, text[], integer, boolean, boolean, text[][]) IS
    'second step of "oracle_migrate": create schemas, sequemces and foreign tables';
 
 CREATE FUNCTION oracle_migrate_tables(
-   staging_schema name    DEFAULT NAME 'ora_stage',
-   pgstage_schema name    DEFAULT NAME 'pgsql_stage',
-   only_schemas   name[]  DEFAULT NULL,
-   with_data      boolean DEFAULT TRUE
+   staging_schema name     DEFAULT NAME 'ora_stage',
+   pgstage_schema name     DEFAULT NAME 'pgsql_stage',
+   only_schemas   text[]   DEFAULT NULL,
+   with_data      boolean  DEFAULT TRUE,
+   schema_remap   text[][] DEFAULT NULL
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
 $$DECLARE
+   pg_schemas   name[];
    old_msglevel text;
    extschema    name;
    sch          name;
@@ -1621,14 +1646,14 @@ BEGIN
    EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
-   only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
+   pg_schemas := array_agg(oname_remapto_pname(os, schema_remap)) FROM unnest(only_schemas) os;
 
    /* loop through all foreign tables to be migrated */
    FOR sch, tab IN
       SELECT schema, table_name FROM tables
       WHERE migrate
-        AND (only_schemas IS NULL
-         OR schema =ANY (only_schemas))
+        AND (pg_schemas IS NULL
+         OR schema =ANY (pg_schemas))
    LOOP
       EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
       RAISE NOTICE 'Migrating table %.% ...', sch, tab;
@@ -1648,15 +1673,17 @@ BEGIN
    RETURN rc;
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_tables(name, name, name[], boolean) IS
+COMMENT ON FUNCTION oracle_migrate_tables(name, name, text[], boolean, text[][]) IS
    'third step of "oracle_migrate": copy tables from Oracle';
 
 CREATE FUNCTION oracle_migrate_sequences(
-   pgstage_schema name    DEFAULT NAME 'pgsql_stage',
-   only_schemas   name[]  DEFAULT NULL
+   pgstage_schema name     DEFAULT NAME 'pgsql_stage',
+   only_schemas   text[]   DEFAULT NULL,
+   schema_remap   text[][] DEFAULT NULL
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
 $$DECLARE
+   pg_schemas   name[];
    extschema    name;
    sch          name;
    seq          name;
@@ -1683,14 +1710,14 @@ BEGIN
    EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
-   only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
+   pg_schemas := array_agg(oname_remapto_pname(os, schema_remap)) FROM unnest(only_schemas) os;
 
    /* loop through all sequences */
    FOR sch, seq, minv, maxv, incr, cycl, cachesiz, lastval IN
       SELECT schema, sequence_name, min_value, max_value, increment_by, cyclical, cache_size, last_value
          FROM sequences
-      WHERE only_schemas IS NULL
-         OR schema =ANY (only_schemas)
+      WHERE pg_schemas IS NULL
+         OR schema =ANY (pg_schemas)
    LOOP
       BEGIN
       EXECUTE format('CREATE SEQUENCE %I.%I INCREMENT %s MINVALUE %s MAXVALUE %s START %s CACHE %s %sCYCLE',
@@ -1735,15 +1762,17 @@ BEGIN
    RETURN rc;
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_sequences(name, name[]) IS
+COMMENT ON FUNCTION oracle_migrate_sequences(name, text[], text[][]) IS
    'sub step of "oracle_migrate_mkforeign": copy sequences from Oracle';
 
 CREATE FUNCTION oracle_migrate_sequences_nextval(
-   pgstage_schema name    DEFAULT NAME 'pgsql_stage',
-   only_schemas   name[]  DEFAULT NULL
+   pgstage_schema name     DEFAULT NAME 'pgsql_stage',
+   only_schemas   text[]   DEFAULT NULL,
+   schema_remap   text[][] DEFAULT NULL
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
 $$DECLARE
+   pg_schemas   name[];
    extschema    name;
    sch          name;
    seq          name;
@@ -1765,14 +1794,14 @@ BEGIN
    EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
-   only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
+   pg_schemas := array_agg(oname_remapto_pname(os, schema_remap)) FROM unnest(only_schemas) os;
 
    /* loop through all sequences */
    FOR sch, seq, lastval IN
       SELECT schema, sequence_name, last_value
          FROM sequences
-      WHERE only_schemas IS NULL
-         OR schema =ANY (only_schemas)
+      WHERE pg_schemas IS NULL
+         OR schema =ANY (pg_schemas)
    LOOP
       BEGIN
       EXECUTE format('ALTER SEQUENCE %I.%I RESTART %s', sch, seq, lastval + 1);
@@ -1813,15 +1842,17 @@ BEGIN
    RETURN rc;
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_sequences_nextval(name, name[]) IS
+COMMENT ON FUNCTION oracle_migrate_sequences_nextval(name, text[], text[][]) IS
    'copy sequences nextval from Oracle';
 
 CREATE FUNCTION oracle_migrate_functions(
-   pgstage_schema name    DEFAULT NAME 'pgsql_stage',
-   only_schemas   name[]  DEFAULT NULL
+   pgstage_schema name     DEFAULT NAME 'pgsql_stage',
+   only_schemas   text[]   DEFAULT NULL,
+   schema_remap   text[][] DEFAULT NULL
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog SET check_function_bodies = off AS
 $$DECLARE
+   pg_schemas   name[];
    extschema    name;
    sch          name;
    fname        name;
@@ -1843,12 +1874,12 @@ BEGIN
    EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
-   only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
+   pg_schemas := array_agg(oname_remapto_pname(os, schema_remap)) FROM unnest(only_schemas) os;
    FOR sch, fname, src IN
       SELECT schema, function_name, source
       FROM functions
-      WHERE (only_schemas IS NULL
-         OR schema =ANY (only_schemas))
+      WHERE (pg_schemas IS NULL
+         OR schema =ANY (pg_schemas))
         AND migrate
    LOOP
       BEGIN
@@ -1893,15 +1924,17 @@ BEGIN
    RETURN rc;
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_functions(name, name[]) IS
+COMMENT ON FUNCTION oracle_migrate_functions(name, text[], text[][]) IS
    'fourth step of "oracle_migrate": create functions';
 
 CREATE FUNCTION oracle_migrate_triggers(
-   pgstage_schema name    DEFAULT NAME 'pgsql_stage',
-   only_schemas   name[]  DEFAULT NULL
+   pgstage_schema name     DEFAULT NAME 'pgsql_stage',
+   only_schemas   text[]   DEFAULT NULL,
+   schema_remap   text[][] DEFAULT NULL
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog SET check_function_bodies = off AS
 $$DECLARE
+   pg_schemas   name[];
    extschema    name;
    sch          name;
    tabname      name;
@@ -1929,13 +1962,13 @@ BEGIN
    EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
-   only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
+   pg_schemas := array_agg(oname_remapto_pname(os, schema_remap)) FROM unnest(only_schemas) os;
    FOR sch, tabname, trigname, bef, event, eachrow, whencl, ref, src IN
       SELECT schema, table_name, trigger_name, is_before, triggering_event,
              for_each_row, when_clause, referencing_names, trigger_body
       FROM triggers
-      WHERE (only_schemas IS NULL
-         OR schema =ANY (only_schemas))
+      WHERE (pg_schemas IS NULL
+         OR schema =ANY (pg_schemas))
         AND migrate
    LOOP
       BEGIN
@@ -1997,15 +2030,17 @@ BEGIN
    RETURN rc;
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_triggers(name, name[]) IS
+COMMENT ON FUNCTION oracle_migrate_triggers(name, text[], text[][]) IS
    'fifth step of "oracle_migrate": create triggers';
 
 CREATE FUNCTION oracle_migrate_views(
-   pgstage_schema name    DEFAULT NAME 'pgsql_stage',
-   only_schemas   name[]  DEFAULT NULL
+   pgstage_schema name     DEFAULT NAME 'pgsql_stage',
+   only_schemas   text[]   DEFAULT NULL,
+   schema_remap   text[][] DEFAULT NULL
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
 $$DECLARE
+   pg_schemas   name[];
    extschema    name;
    sch          name;
    vname        name;
@@ -2030,12 +2065,12 @@ BEGIN
    EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
-   only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
+   pg_schemas := array_agg(oname_remapto_pname(os, schema_remap)) FROM unnest(only_schemas) os;
    FOR sch, vname, src IN
       SELECT schema, view_name, definition
       FROM views
-      WHERE (only_schemas IS NULL
-         OR schema =ANY (only_schemas))
+      WHERE (pg_schemas IS NULL
+         OR schema =ANY (pg_schemas))
         AND migrate
    LOOP
       stmt := format(E'CREATE VIEW %I.%I (', sch, vname);
@@ -2096,15 +2131,17 @@ BEGIN
    RETURN rc;
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_views(name, name[]) IS
+COMMENT ON FUNCTION oracle_migrate_views(name, text[], text[][]) IS
    'sixth step of "oracle_migrate": create views';
 
 CREATE FUNCTION oracle_migrate_constraints(
-   pgstage_schema name    DEFAULT NAME 'pgsql_stage',
-   only_schemas   name[]  DEFAULT NULL
+   pgstage_schema name     DEFAULT NAME 'pgsql_stage',
+   only_schemas   text[]   DEFAULT NULL,
+   schema_remap   text[][] DEFAULT NULL
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
 $$DECLARE
+   pg_schemas   name[];
    extschema    name;
    stmt         text;
    stmt_middle  text;
@@ -2147,7 +2184,7 @@ BEGIN
    EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
-   only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
+   pg_schemas := array_agg(oname_remapto_pname(os, schema_remap)) FROM unnest(only_schemas) os;
 
    EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
    RAISE NOTICE 'Creating UNIQUE and PRIMARY KEY constraints ...';
@@ -2163,8 +2200,8 @@ BEGIN
       FROM keys k
          JOIN tables t
             USING (schema, table_name)
-      WHERE (only_schemas IS NULL
-         OR k.schema =ANY (only_schemas))
+      WHERE (pg_schemas IS NULL
+         OR k.schema =ANY (pg_schemas))
         AND t.migrate
         AND k.migrate
       ORDER BY schema, table_name, k.constraint_name, k.position
@@ -2271,9 +2308,9 @@ BEGIN
             USING (schema, table_name)
          JOIN tables tf
             ON fk.remote_schema = tf.schema AND fk.remote_table = tf.table_name
-      WHERE (only_schemas IS NULL
-         OR fk.schema =ANY (only_schemas)
-            AND fk.remote_schema =ANY (only_schemas))
+      WHERE (pg_schemas IS NULL
+         OR fk.schema =ANY (pg_schemas)
+            AND fk.remote_schema =ANY (pg_schemas))
         AND tl.migrate
         AND tf.migrate
         AND fk.migrate
@@ -2375,8 +2412,8 @@ BEGIN
       FROM checks c
          JOIN tables t
             USING (schema, table_name)
-      WHERE (only_schemas IS NULL
-         OR schema =ANY (only_schemas))
+      WHERE (pg_schemas IS NULL
+         OR schema =ANY (pg_schemas))
         AND t.migrate
         AND c.migrate
    LOOP
@@ -2428,8 +2465,8 @@ BEGIN
             USING (schema, table_name, index_name)
          JOIN tables t
             USING (schema, table_name)
-      WHERE (only_schemas IS NULL
-         OR schema =ANY (only_schemas))
+      WHERE (pg_schemas IS NULL
+         OR schema =ANY (pg_schemas))
         AND t.migrate
         AND ind.migrate
       ORDER BY schema, table_name, i.index_name, i.position
@@ -2527,8 +2564,8 @@ BEGIN
       FROM columns c
          JOIN tables t
             USING (schema, table_name)
-      WHERE (only_schemas IS NULL
-         OR schema =ANY (only_schemas))
+      WHERE (pg_schemas IS NULL
+         OR schema =ANY (pg_schemas))
         AND t.migrate
         AND c.default_value IS NOT NULL
    LOOP
@@ -2574,8 +2611,8 @@ BEGIN
    RETURN rc;
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_constraints(name, name[])
-   IS 'seventh step of "oracle_migrate": create constraints and indexes';
+COMMENT ON FUNCTION oracle_migrate_constraints(name, text[], text[][]) IS
+   'seventh step of "oracle_migrate": create constraints and indexes';
 
 CREATE FUNCTION oracle_migrate_finish(
    staging_schema name    DEFAULT NAME 'ora_stage',
@@ -2606,11 +2643,12 @@ COMMENT ON FUNCTION oracle_migrate_finish(name, name) IS
 
 CREATE FUNCTION oracle_migrate(
    server         name,
-   staging_schema name    DEFAULT NAME 'ora_stage',
-   pgstage_schema name    DEFAULT NAME 'pgsql_stage',
-   only_schemas   name[]  DEFAULT NULL,
-   max_long       integer DEFAULT 32767,
-   with_data      boolean DEFAULT TRUE
+   staging_schema name     DEFAULT NAME 'ora_stage',
+   pgstage_schema name     DEFAULT NAME 'pgsql_stage',
+   only_schemas   text[]   DEFAULT NULL,
+   max_long       integer  DEFAULT 32767,
+   with_data      boolean  DEFAULT TRUE,
+   schema_remap   text[][] DEFAULT NULL
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
 $$DECLARE
@@ -2627,43 +2665,43 @@ BEGIN
     * First step:
     * Create staging schema and define the oracle metadata views there.
     */
-   rc := rc + oracle_migrate_prepare(server, staging_schema, pgstage_schema, only_schemas, max_long);
+   rc := rc + oracle_migrate_prepare(server, staging_schema, pgstage_schema, only_schemas, max_long, schema_remap);
 
    /*
     * Second step:
     * Create the destination schemas and the foreign tables and sequences there.
     */
-   rc := rc + oracle_migrate_mkforeign(server, staging_schema, pgstage_schema, only_schemas, max_long);
+   rc := rc + oracle_migrate_mkforeign(server, staging_schema, pgstage_schema, only_schemas, max_long, schema_remap);
 
    /*
     * Third step:
     * Copy the tables over from Oracle.
     */
-   rc := rc + oracle_migrate_tables(staging_schema, pgstage_schema, only_schemas, with_data);
+   rc := rc + oracle_migrate_tables(staging_schema, pgstage_schema, only_schemas, with_data, schema_remap);
 
    /*
     * Fourth step:
     * Create functions (this won't do anything since they have "migrate = FALSE").
     */
-   rc := rc + oracle_migrate_functions(pgstage_schema, only_schemas);
+   rc := rc + oracle_migrate_functions(pgstage_schema, only_schemas, schema_remap);
 
    /*
     * Fifth step:
     * Create triggers (this won't do anything since they have "migrate = FALSE").
     */
-   rc := rc + oracle_migrate_triggers(pgstage_schema, only_schemas);
+   rc := rc + oracle_migrate_triggers(pgstage_schema, only_schemas, schema_remap);
 
    /*
     * Sixth step:
     * Create views.
     */
-   rc := rc + oracle_migrate_views(pgstage_schema, only_schemas);
+   rc := rc + oracle_migrate_views(pgstage_schema, only_schemas, schema_remap);
 
    /*
     * Seventh step:
     * Create constraints and indexes.
     */
-   rc := rc + oracle_migrate_constraints(pgstage_schema, only_schemas);
+   rc := rc + oracle_migrate_constraints(pgstage_schema, only_schemas, schema_remap);
 
    /*
     * Final step:
@@ -2676,7 +2714,7 @@ BEGIN
    RETURN rc;
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate(name, name, name, name[], integer, boolean) IS
+COMMENT ON FUNCTION oracle_migrate(name, name, name, text[], integer, boolean, text[][]) IS
    'migrate an Oracle database from a foreign server to PostgreSQL';
 
 CREATE FUNCTION oracle_code_count(
@@ -2874,14 +2912,16 @@ COMMENT ON FUNCTION oracle_test_table(name, name, name, name) IS
 
 CREATE FUNCTION oracle_migrate_test_data(
    server         name,
-   pgstage_schema name DEFAULT NAME 'pgsql_stage',
-   only_schemas   name[]  DEFAULT NULL
+   pgstage_schema name     DEFAULT NAME 'pgsql_stage',
+   only_schemas   text[]   DEFAULT NULL,
+   schema_remap   text[][] DEFAULT NULL
 ) RETURNS bigint
    LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog AS
 $$DECLARE
-   extschema text;
-   v_schema  text;
-   v_table   text;
+   pg_schemas name[];
+   extschema  text;
+   v_schema   text;
+   v_table    text;
 BEGIN
    /* set "search_path" to the PostgreSQL staging schema and the extension schema */
    SELECT extnamespace::regnamespace INTO extschema
@@ -2890,7 +2930,7 @@ BEGIN
    EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
 
    /* translate schema names to lower case */
-   only_schemas := array_agg(oracle_tolower(os)) FROM unnest(only_schemas) os;
+   pg_schemas := array_agg(oname_remapto_pname(os, schema_remap)) FROM unnest(only_schemas) os;
 
    /* purge the error detail log */
    TRUNCATE test_error;
@@ -2898,8 +2938,8 @@ BEGIN
    /* collect the errors from each table */
    FOR v_schema, v_table IN
       SELECT schema, table_name FROM tables
-      WHERE only_schemas IS NULL
-         OR schema =ANY (only_schemas)
+      WHERE pg_schemas IS NULL
+         OR schema =ANY (pg_schemas)
    LOOP
       INSERT INTO test_error
          (schema, table_name, rowid, message)
@@ -2925,5 +2965,5 @@ BEGIN
            WHERE log_time = current_timestamp);
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_test_data(name, name, name[]) IS
+COMMENT ON FUNCTION oracle_migrate_test_data(name, name, text[], text[][]) IS
    'test all Oracle table for potential migration problems';
