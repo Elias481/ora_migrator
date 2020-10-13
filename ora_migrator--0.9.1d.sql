@@ -1396,6 +1396,9 @@ $$DECLARE
    extschema    name;
    sch          name;
    tab          name;
+   seq          name;
+   osch         varchar(128);
+   otab         varchar(128);
    iserr        boolean;
    oquery       text;
    ncname       name[];
@@ -1418,22 +1421,23 @@ BEGIN
    pg_schemas := array_agg(oname_remapto_pname(os, schema_remap)) FROM unnest(only_schemas) os;
 
    EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
-   RAISE NOTICE 'Asses schemas ...';
+   RAISE NOTICE 'Asses tables ...';
    SET LOCAL client_min_messages = warning;
   
    /* loop through all foreign tables to be migrated */
-   FOR sch, tab IN
-      SELECT schema, table_name FROM tables
+   FOR sch, tab, osch, otab IN
+      SELECT schema, table_name, oracle_schema, oracle_name
+      FROM tables
       WHERE migrate
         AND state IS NULL
         AND (pg_schemas IS NULL
          OR schema =ANY (pg_schemas))
    LOOP
       WITH tc AS (
-       SELECT COALESCE(i.sname, e.sname) AS schema_name, COALESCE(i.tname, e.tname) AS table_name, COALESCE(i.cname, e.cname) AS column_name, e.cpos tcpos, i.osname, i.otname, i.ocname, e.tpe,
+       SELECT COALESCE(i.sname, e.sname) AS schema_name, COALESCE(i.tname, e.tname) AS table_name, COALESCE(i.cname, e.cname) AS column_name, e.cpos tcpos, i.ocname, e.tpe,
         e.cpos = i.cpos AND e.tpe = i.tpe AS ptm, e.cpos = i.cpos AS pom, e.tpe = i.tpe AS tym, e.cname IS NOT NULL AND e.cnn AND i.cname IS NULL OR e.cname IS NULL AND i.cname IS NOT NULL AS err
        FROM (
-        SELECT t.schema AS sname, t.table_name AS tname, c.column_name AS cname, t.oracle_schema AS osname, t.oracle_name AS otname, c.oracle_name AS ocname, c.position AS cpos, c.type_name AS tpe
+        SELECT t.schema AS sname, t.table_name AS tname, c.column_name AS cname, c.oracle_name AS ocname, c.position AS cpos, c.type_name AS tpe
         FROM tables t
         INNER JOIN columns c ON c.schema = t.schema AND c.table_name = t.table_name
        ) i
@@ -1448,12 +1452,12 @@ BEGIN
       )
       SELECT COUNT(1) FILTER(WHERE err) > 0 AS error,
        CASE WHEN COUNT(1) = COUNT(1) FILTER(WHERE pom) OR COUNT(1) FILTER(WHERE err) > 0 THEN NULL ELSE
-        'SELECT '||STRING_AGG(CASE WHEN ocname IS NULL THEN 'NULL' ELSE '"'||ocname||'"' END, ', ' ORDER BY tcpos)||' FROM "'||osname||'"."'||otname||'"'
+        'SELECT '||STRING_AGG(CASE WHEN ocname IS NULL THEN 'NULL' ELSE '"'||ocname||'"' END, ', ' ORDER BY tcpos)||' FROM "'||osch||'"."'||otab||'"'
        END AS qry,
        CASE WHEN COUNT(1) = COUNT(1) FILTER(WHERE ptm) OR COUNT(1) FILTER(WHERE err) > 0 THEN NULL ELSE ARRAY_AGG(column_name) END AS tfn,
        CASE WHEN COUNT(1) = COUNT(1) FILTER(WHERE ptm) OR COUNT(1) FILTER(WHERE err) > 0 THEN NULL ELSE ARRAY_AGG(tcpos) END AS tfp,
        CASE WHEN COUNT(1) = COUNT(1) FILTER(WHERE ptm) OR COUNT(1) FILTER(WHERE err) > 0 THEN NULL ELSE ARRAY_AGG(tpe) END AS tft INTO STRICT iserr, oquery, ncname, nindex, nctype
-      FROM tc GROUP BY schema_name, table_name, osname, otname;
+      FROM tc GROUP BY schema_name, table_name;
       
       IF iserr THEN
          UPDATE tables SET migrate = false WHERE schema = sch AND table_name = tab;
@@ -1465,6 +1469,27 @@ BEGIN
          UPDATE columns SET position = nindex[array_position(ncname, column_name)], type_name = nctype[array_position(ncname, column_name)] WHERE schema = sch AND table_name = tab;
       END IF;
    END LOOP;
+
+   IF with_sequences THEN
+
+      EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
+      RAISE NOTICE 'Asses sequences ...';
+      SET LOCAL client_min_messages = warning;
+
+      /* disable migration for non-existing sequences */
+      FOR sch, seq IN
+         SELECT s.schema, s.sequence_name
+            FROM sequences s
+            LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = s.schema
+            LEFT JOIN pg_catalog.pg_class c ON c.relkind = 'S' AND c.relname = s.sequence_name AND c.relnamespace = n.oid
+         WHERE s.migrate
+            AND (pg_schemas IS NULL
+             OR s.schema =ANY (pg_schemas))
+            AND c.relname IS NULL
+      LOOP
+         UPDATE sequences SET migrate = false WHERE schema = sch and sequence_name = seq;
+      END LOOP;
+   END IF;
 
    /* reset client_min_messages */
    EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
@@ -1598,7 +1623,7 @@ BEGIN
           'FROM columns pc\n'
           '   JOIN tables pt\n'
           '      USING (schema, table_name)\n'
-          'WHERE pt.migrate\n'
+          'WHERE pt.migrate AND pt.state IS NULL\n'
           'ORDER BY schema, table_name, pc.position',
          staging_schema)
    LOOP
@@ -1621,7 +1646,7 @@ BEGIN
                   GET STACKED DIAGNOSTICS
                      errmsg := MESSAGE_TEXT,
                      detail := PG_EXCEPTION_DETAIL;
-                  RAISE WARNING 'Error creating foreign table %.%', sch, tab
+                  RAISE WARNING 'Error creating foreign table %.%', o_sch, O-tab
                      USING DETAIL = errmsg || coalesce(': ' || detail, '');
 
                   EXECUTE
