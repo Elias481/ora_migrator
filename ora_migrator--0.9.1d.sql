@@ -622,6 +622,9 @@ BEGIN
       /* drop the foreign table */
       EXECUTE format('DROP FOREIGN TABLE %I.%I', s, ft);
 
+      /* save table state */
+      EXECUTE format('UPDATE %I.tables SET state = 1 WHERE schema = %L AND table_name = %L', pgstage_schema, s, t);
+
       RETURN TRUE;
    EXCEPTION
       WHEN others THEN
@@ -1149,6 +1152,7 @@ BEGIN
       oracle_name   varchar(128) NOT NULL,
       oracle_query  text         NULL,
       migrate       boolean      NOT NULL DEFAULT TRUE,
+      state         smallint     NULL,
       CONSTRAINT tables_pkey
          PRIMARY KEY (schema, table_name)
    );
@@ -1229,6 +1233,7 @@ BEGIN
       cache_size    integer NOT NULL,
       last_value    bigint  NOT NULL,
       oracle_value  bigint  NOT NULL,
+      migrate       boolean NOT NULL DEFAULT TRUE,
       CONSTRAINT sequences_pkey
          PRIMARY KEY (schema, sequence_name)
    );
@@ -1376,6 +1381,101 @@ END;$$;
 COMMENT ON FUNCTION oracle_migrate_prepare(name, name, name, text[], integer, text[][]) IS
    'first step of "oracle_migrate": create and populate staging schemas';
 
+
+CREATE FUNCTION oracle_migrate_assess(
+   server          name,
+   pgstage_schema  name     DEFAULT NAME 'pgsql_stage',
+   only_schemas    text[]   DEFAULT NULL,
+   with_sequences  boolean  DEFAULT TRUE,
+   schema_remap    text[][] DEFAULT NULL
+) RETURNS integer
+   LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
+$$DECLARE
+   pg_schemas   name[];
+   old_msglevel text;
+   extschema    name;
+   sch          name;
+   tab          name;
+   iserr        boolean;
+   oquery       text;
+   ncname       name[];
+   nindex       integer[];
+   nctype       varchar(128)[];
+   rc           integer := 0;
+BEGIN
+   /* remember old setting */
+   old_msglevel := current_setting('client_min_messages');
+   /* make the output less verbose */
+   SET LOCAL client_min_messages = warning;
+
+   /* set "search_path" to the PostgreSQL staging schema and the extension schema */
+   SELECT extnamespace::regnamespace INTO extschema
+      FROM pg_catalog.pg_extension
+      WHERE extname = 'ora_migrator';
+   EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
+   
+   /* translate schema names to lower case */
+   pg_schemas := array_agg(oname_remapto_pname(os, schema_remap)) FROM unnest(only_schemas) os;
+
+   EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
+   RAISE NOTICE 'Asses schemas ...';
+   SET LOCAL client_min_messages = warning;
+  
+   /* loop through all foreign tables to be migrated */
+   FOR sch, tab IN
+      SELECT schema, table_name FROM tables
+      WHERE migrate
+        AND state IS NULL
+        AND (pg_schemas IS NULL
+         OR schema =ANY (pg_schemas))
+   LOOP
+      WITH tc AS (
+       SELECT COALESCE(i.sname, e.sname) AS schema_name, COALESCE(i.tname, e.tname) AS table_name, COALESCE(i.cname, e.cname) AS column_name, e.cpos tcpos, i.osname, i.otname, i.ocname, e.tpe,
+        e.cpos = i.cpos AND e.tpe = i.tpe AS ptm, e.cpos = i.cpos AS pom, e.tpe = i.tpe AS tym, e.cname IS NOT NULL AND e.cnn AND i.cname IS NULL OR e.cname IS NULL AND i.cname IS NOT NULL AS err
+       FROM (
+        SELECT t.schema AS sname, t.table_name AS tname, c.column_name AS cname, t.oracle_schema AS osname, t.oracle_name AS otname, c.oracle_name AS ocname, c.position AS cpos, c.type_name AS tpe
+        FROM tables t
+        INNER JOIN columns c ON c.schema = t.schema AND c.table_name = t.table_name
+       ) i
+       FULL JOIN (
+        SELECT n.nspname AS sname, c.relname AS tname, a.attname as cname, a.attnum AS cpos, a.attnotnull AS cnn, pg_catalog.format_type(a.atttypid, a.atttypmod) AS tpe
+        FROM pg_catalog.pg_class c
+        INNER JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        INNER JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0
+        WHERE c.relkind = 'r'
+       ) e USING(sname, tname, cname)
+       WHERE COALESCE(i.sname, e.sname) = sch AND COALESCE(i.tname, e.tname) = tab
+      )
+      SELECT COUNT(1) FILTER(WHERE err) > 0 AS error,
+       CASE WHEN COUNT(1) = COUNT(1) FILTER(WHERE pom) OR COUNT(1) FILTER(WHERE err) > 0 THEN NULL ELSE
+        'SELECT '||STRING_AGG(CASE WHEN ocname IS NULL THEN 'NULL' ELSE '"'||ocname||'"' END, ', ' ORDER BY tcpos)||' FROM "'||osname||'"."'||otname||'"'
+       END AS qry,
+       CASE WHEN COUNT(1) = COUNT(1) FILTER(WHERE ptm) OR COUNT(1) FILTER(WHERE err) > 0 THEN NULL ELSE ARRAY_AGG(column_name) END AS tfn,
+       CASE WHEN COUNT(1) = COUNT(1) FILTER(WHERE ptm) OR COUNT(1) FILTER(WHERE err) > 0 THEN NULL ELSE ARRAY_AGG(tcpos) END AS tfp,
+       CASE WHEN COUNT(1) = COUNT(1) FILTER(WHERE ptm) OR COUNT(1) FILTER(WHERE err) > 0 THEN NULL ELSE ARRAY_AGG(tpe) END AS tft INTO STRICT iserr, oquery, ncname, nindex, nctype
+      FROM tc GROUP BY schema_name, table_name, osname, otname;
+      
+      IF iserr THEN
+         UPDATE tables SET migrate = false WHERE schema = sch AND table_name = tab;
+         rc := rc + 1;
+      ELSIF oquery IS NOT NULL THEN
+         UPDATE tables SET oracle_query = oquery WHERE schema = sch AND table_name = tab;
+         UPDATE columns SET position = nindex[array_position(ncname, column_name)], type_name = nctype[array_position(ncname, column_name)] WHERE schema = sch AND table_name = tab;
+      ELSIF ncname IS NOT NULL THEN
+         UPDATE columns SET position = nindex[array_position(ncname, column_name)], type_name = nctype[array_position(ncname, column_name)] WHERE schema = sch AND table_name = tab;
+      END IF;
+   END LOOP;
+
+   /* reset client_min_messages */
+   EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
+
+   RETURN rc;
+END;$$;
+
+COMMENT ON FUNCTION oracle_migrate_assess(name, name, text[], boolean, text[][]) IS
+   'second step of "oracle_migrate": validate and where possible transformate foreign definitions';
+
+
 CREATE FUNCTION oracle_migrate_mkforeign(
    server          name,
    staging_schema  name     DEFAULT NAME 'ora_stage',
@@ -1511,8 +1611,8 @@ BEGIN
                                       server, o_fsch, o_ftab, max_long);
                ELSE
                   stmt := stmt || format(E') SERVER %I\n'
-                                       '   OPTIONS (table ''(%s)'', readonly ''true'', max_long ''%s'')',
-                                      server, quote_literal(o_fquery), max_long);
+                                       '   OPTIONS (table %L, readonly ''true'', max_long ''%s'')',
+                                      server, '('||o_fquery||')', max_long);
                END IF;
                EXECUTE stmt;
             EXCEPTION
@@ -1549,7 +1649,7 @@ BEGIN
          IF deferred_rename THEN
             stmt := format(E'CREATE FOREIGN TABLE %I.%I (\n', sch, tab);
          ELSE
-            stmt := format(E'CREATE FOREIGN TABLE %I.%I\x07 (\n', sch, tab);
+            stmt := format(E'CREATE FOREIGN TABLE %I.%I (\n', sch, tab||E'\x07');
          END IF;
          o_sch := sch;
          o_tab := tab;
@@ -1574,8 +1674,8 @@ BEGIN
                                 server, o_fsch, o_ftab, max_long);
          ELSE
             stmt := stmt || format(E') SERVER %I\n'
-                                 '   OPTIONS (table ''(%s)'', readonly ''true'', max_long ''%s'')',
-                                server, quote_literal(o_fquery), max_long);
+                                 '   OPTIONS (table %L, readonly ''true'', max_long ''%s'')',
+                                server, '('||o_fquery||')', max_long);
          END IF;
          EXECUTE stmt;
       EXCEPTION
@@ -1623,7 +1723,9 @@ CREATE FUNCTION oracle_migrate_tables(
    pgstage_schema name     DEFAULT NAME 'pgsql_stage',
    only_schemas   text[]   DEFAULT NULL,
    with_data      boolean  DEFAULT TRUE,
-   schema_remap   text[][] DEFAULT NULL
+   schema_remap   text[][] DEFAULT NULL,
+   with_create    boolean  DEFAULT TRUE,
+   deferred_rename boolean DEFAULT TRUE
 ) RETURNS integer
    LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
 $$DECLARE
@@ -1652,6 +1754,7 @@ BEGIN
    FOR sch, tab IN
       SELECT schema, table_name FROM tables
       WHERE migrate
+        AND state IS NULL
         AND (pg_schemas IS NULL
          OR schema =ANY (pg_schemas))
    LOOP
@@ -1660,10 +1763,11 @@ BEGIN
       SET LOCAL client_min_messages = warning;
 
       /* turn that foreign table into a real table */
-      IF NOT oracle_materialize(sch, tab, with_data, pgstage_schema) THEN
+      IF NOT oracle_materialize(sch, tab, with_data, pgstage_schema, with_create, deferred_rename) THEN
          rc := rc + 1;
          /* remove the foreign table if it failed */
          EXECUTE format('DROP FOREIGN TABLE %I.%I', sch, tab);
+         EXECUTE format('UPDATE %I.tables SET state = 0 WHERE schema = %L AND table_name = %L', pgstage_schema, sch, tab);
       END IF;
    END LOOP;
 
@@ -1673,8 +1777,79 @@ BEGIN
    RETURN rc;
 END;$$;
 
-COMMENT ON FUNCTION oracle_migrate_tables(name, name, text[], boolean, text[][]) IS
+COMMENT ON FUNCTION oracle_migrate_tables(name, name, text[], boolean, text[][], boolean, boolean) IS
    'third step of "oracle_migrate": copy tables from Oracle';
+
+
+CREATE FUNCTION oracle_migrate_tables_sync(
+   staging_schema name     DEFAULT NAME 'ora_stage',
+   pgstage_schema name     DEFAULT NAME 'pgsql_stage',
+   only_schemas   text[]   DEFAULT NULL,
+   with_data      boolean  DEFAULT TRUE,
+   schema_remap   text[][] DEFAULT NULL,
+   with_create    boolean  DEFAULT TRUE,
+   deferred_rename boolean DEFAULT TRUE
+) RETURNS integer
+   LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT SET search_path = pg_catalog AS
+$$DECLARE
+   pg_schemas   name[];
+   old_msglevel text;
+   extschema    name;
+   sch          name;
+   tab          name;
+   rc           integer := 0;
+BEGIN
+   /* remember old setting */
+   old_msglevel := current_setting('client_min_messages');
+   /* make the output less verbose */
+   SET LOCAL client_min_messages = warning;
+
+   /* set "search_path" to the Oracle stage and the extension schema */
+   SELECT extnamespace::regnamespace INTO extschema
+      FROM pg_catalog.pg_extension
+      WHERE extname = 'ora_migrator';
+   EXECUTE format('SET LOCAL search_path = %I, %s', pgstage_schema, extschema);
+
+   /* translate schema names to lower case */
+   pg_schemas := array_agg(oname_remapto_pname(os, schema_remap)) FROM unnest(only_schemas) os;
+
+   /* loop through all foreign tables to be migrated */
+   LOOP
+      SELECT schema, table_name INTO sch, tab
+      FROM tables
+      WHERE migrate
+        AND state IS NULL
+        AND (pg_schemas IS NULL
+         OR schema =ANY (pg_schemas))
+      LIMIT 1
+      FOR NO KEY UPDATE SKIP LOCKED;
+
+      IF NOT FOUND THEN
+         exit;
+      END IF;
+
+      EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
+      RAISE NOTICE 'Migrating table %.% ...', sch, tab;
+      SET LOCAL client_min_messages = warning;
+
+      /* turn that foreign table into a real table */
+      IF NOT oracle_materialize(sch, tab, with_data, pgstage_schema, with_create, deferred_rename) THEN
+         rc := rc + 1;
+         /* remove the foreign table if it failed */
+         EXECUTE format('DROP FOREIGN TABLE %I.%I', sch, tab||E'\x07');
+         EXECUTE format('UPDATE %I.tables SET state = 0 WHERE schema = %L AND table_name = %L', pgstage_schema, sch, tab);
+      END IF;
+   END LOOP;
+
+   /* reset client_min_messages */
+   EXECUTE 'SET LOCAL client_min_messages = ' || old_msglevel;
+
+   RETURN rc;
+END;$$;
+
+COMMENT ON FUNCTION oracle_migrate_tables_sync(name, name, text[], boolean, text[][], boolean, boolean) IS
+   'third step of "oracle_migrate": copy tables from Oracle (with syncronization)';
+
 
 CREATE FUNCTION oracle_migrate_sequences(
    pgstage_schema name     DEFAULT NAME 'pgsql_stage',
@@ -1716,8 +1891,9 @@ BEGIN
    FOR sch, seq, minv, maxv, incr, cycl, cachesiz, lastval IN
       SELECT schema, sequence_name, min_value, max_value, increment_by, cyclical, cache_size, last_value
          FROM sequences
-      WHERE pg_schemas IS NULL
-         OR schema =ANY (pg_schemas)
+      WHERE migrate
+         AND (pg_schemas IS NULL
+          OR schema =ANY (pg_schemas))
    LOOP
       BEGIN
       EXECUTE format('CREATE SEQUENCE %I.%I INCREMENT %s MINVALUE %s MAXVALUE %s START %s CACHE %s %sCYCLE',
@@ -1800,8 +1976,9 @@ BEGIN
    FOR sch, seq, lastval IN
       SELECT schema, sequence_name, last_value
          FROM sequences
-      WHERE pg_schemas IS NULL
-         OR schema =ANY (pg_schemas)
+      WHERE migrate
+         AND (pg_schemas IS NULL
+          OR schema =ANY (pg_schemas))
    LOOP
       BEGIN
       EXECUTE format('ALTER SEQUENCE %I.%I RESTART %s', sch, seq, lastval + 1);
